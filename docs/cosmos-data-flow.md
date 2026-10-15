@@ -39,6 +39,11 @@ plus working-tree fixes; scope: ordered ApplyDesire removal, ReadDesire cleanup,
 concurrent Cluster Service delete dispatch, and the cluster-delete diagram.
 
 The generation instructions are maintained in [controller-data-flow.md](prompts/controller-data-flow.md).
+
+Billing managed-RG repair update baseline: `844849cb5` plus working-tree changes;
+scope: `ReconcileBillingManagedResourceGroup` registration, conditional Billing
+patches, and ownership. This background repair adds no cluster lifecycle gate or
+external-resource action; lifecycle diagrams are unchanged.
 The historical filename is retained for existing links.
 
 - [Cosmos request attribution](#request-unit-ru-attribution)
@@ -729,7 +734,7 @@ is recomputed on each request; this creates no policy for future clusters.
 
 ## 2. Complete Controller Catalog
 
-The catalog contains **135 entries**: 109 backend instances, 12 fleet controllers,
+The catalog contains **138 entries**: 112 backend instances, 12 fleet controllers,
 three kube-applier controller types, eight management-agent controllers/watchers,
 two sessiongate controllers and one shared union-informer controller. Dynamic
 validation and metrics instances are listed individually; dynamically created
@@ -751,13 +756,13 @@ infrastructure, not additional controller catalog entries.
 | Management-agent | [options.go](../mgmt-agent/cmd/options.go) |
 | Sessiongate | [options.go](../sessiongate/cmd/options.go) |
 
-The backend registry represents **110 launches**: 108 instances in the billing,
+The backend registry represents **113 launches**: 111 instances in the billing,
 cluster, clusterresources, cosmosmigration, datadump, externalauth, metrics,
 mismatch, and nodepool zones, the Azure SKU cached-reader controller, and the
-shared union kube-applier informer controller. This matches the catalog's 109
+shared union kube-applier informer controller. This matches the catalog's 112
 backend instances plus the separately counted shared union controller.
 `ClusterDenyAssignment` is instantiated and launched only when `HasRealFPA` is
-true; otherwise 109 controllers run. The flag is also passed to cluster creation.
+true; otherwise 112 controllers run. The flag is also passed to cluster creation.
 
 Each top-level controller package owns a `registration.go` file and a `Register`
 function: [billing](../backend/pkg/controllers/billing/registration.go),
@@ -813,7 +818,8 @@ Registry entries retain the existing worker counts: 20 by default, one for each
 of the six metrics controllers and the union informer controller, five for
 `PendingCleanup`, `CosmosMigration` and `CosmosRolloutVersionMigration`, and ten for
 `DeleteOrphanedCosmosResources`. `BackfillClusterUID` retains its 60-minute resync
-and `CreateBillingDoc` its 60-second resync. Registry keys are lowercased existing
+and `CreateBillingDoc` its 60-second resync. `ReconcileBillingManagedResourceGroup`
+uses a 60-minute resync and 20 workers. Registry keys are lowercased existing
 controller names; log, metric, and persisted controller identities are unchanged.
 These startup gates do not change the catalog's reconciliation effects or the
 field/condition edges in the lifecycle DOT sources and PNGs below.
@@ -1547,6 +1553,37 @@ copies and diagnostic snapshots. An absent watermark remains nil.
 
 Repairs a missing cluster `ServiceProviderProperties.ClusterUID`: reuses the ID of an active billing document with the same creation time, otherwise generates a UUID. Writes only the cluster document; billing is an input.
 
+#### ReconcileBillingManagedResourceGroup
+
+[Source](../backend/pkg/controllers/billing/reconcile_billing_managed_resource_group.go) · [Registration](../backend/pkg/controllers/billing/registration.go) · **Trigger:** Cluster and BillingDocument add/update events and 60m informer resync; no union kube-applier dependency. Waits for both caches before processing. Billing events map the document's cluster ARM resource ID to the workqueue key; an owner-ID update queues both old and new clusters. Missing IDs and non-cluster IDs are ignored by event routing; periodic cluster resync still checks linked records.
+
+Repairs existing linked billing documents whose `managedResourceGroup` differs
+from the cluster's configured `CustomerProperties.Platform.ManagedResourceGroup`.
+Skips missing clusters/documents, unlinked clusters, deleting clusters and billing
+documents with `deletionTime`. Requires the billing document ID, cluster UID and
+cluster billing reference to agree, plus matching subscription and resource ID;
+identity mismatch or an empty configured RG emits a structured error log with
+`event=billing_metadata_inconsistency`, a stable `reason`, cluster identity and
+billing document ID, without writing billing. These data inconsistencies return
+success rather than entering the error retry loop;
+input events and periodic resync recheck them. There is no customer-RG fallback
+or creation-time matching.
+
+Uses cached objects to skip already-converged documents, then live cluster and
+billing reads before any write. Case and trailing-slash differences alone are
+equivalent. Patches only `/managedResourceGroup` by document ID, conditional on
+the live document's `_etag` matching and `deletionTime` remaining absent/null.
+Missing ETags fail closed. A precondition failure returns an error for a
+rate-limited retry that rereads both live records and recomputes the repair;
+document removal is a no-op. The ETag protects the billing document, not an atomic
+transaction with the separately read cluster document.
+Preserves billing watermarks and lifecycle timestamps, and never creates/deletes
+billing documents. The generic worker logs and rate-limits retries for transient
+storage failures without writing per-cluster `Controller` status. Neither data
+inconsistencies nor storage failures contribute to cluster degradation. There are no Azure or Cluster
+Service calls. Repair changes future
+compute lookup; historical usage replay is outside this controller.
+
 #### OrphanedBillingCleanup
 
 [Source](../backend/pkg/controllers/billing/orphaned_billing_cleanup.go) · **Trigger:** Global billing sweep; 60m.
@@ -2048,6 +2085,7 @@ actors and use optimistic concurrency; retries must re-read on conflict.
 | Cluster `PendingClusterServiceID` / `ClusterServiceID` | [Pending ID assignment](#clusterpendingclusterserviceidassign) reserves the ID. [Cluster creation](#clusterclusterservicecreate) confirms the external ID and clears pending. The [ID clearer](#clusterdeletionclusterserviceidclearer) clears confirmed ID only after external absence. Node-pool/external-auth create and clear controllers similarly share their confirmed-ID fields. |
 | `ClusterServiceDeletionTimestamp` | Each delete dispatcher stamps completion of dispatch/creation-race handling; cleanup also requires the confirmed ID cleared. It is not a timestamp of all Azure/Kubernetes deletion. |
 | Cluster `ClusterUID`, `BillingDocumentCosmosID`; Billing document `DeletionTime` | [BackfillClusterUID](#backfillclusteruid) repairs UID using billing as input. [CreateBillingDoc](#createbillingdoc) creates billing and links it. [ClusterDeletionController](#clusterdeletioncontroller) and [OrphanedBillingCleanup](#orphanedbillingcleanup) mark billing deleted. |
+| Billing document `ManagedResourceGroup` | [CreateBillingDoc](#createbillingdoc) initializes it. [ReconcileBillingManagedResourceGroup](#reconcilebillingmanagedresourcegroup) repairs linked active records from the cluster's configured managed RG with a field-specific conditional patch. |
 | Cluster `ServiceProviderProperties.API.URL`, `.Console.URL`, `.DNS.BaseDomain`, `.Platform.IssuerURL` | [ClusterPropertiesSync](#clusterpropertiessync) writes observed values. Frontend clears supplied values on create rather than persisting them; updates preserve stored values. |
 | Cluster `Identity.UserAssignedIdentities` | Frontend supplies identity intent without create-body client/principal IDs; [ClusterIdentitySync](#clusteridentitysync) fills resolved identity fields. Updates preserve stored resolved values. Azure identities themselves are not created by that syncer. |
 | Cluster/node-pool `Status.ActiveVersions` | [ControlPlaneActiveVersions](#controlplaneactiveversions) writes distinct major.minor cluster versions; [NodePoolActiveVersions](#nodepoolactiveversions) writes full node-pool versions. The 2026-10-01 API returns these stored observations through `properties.status.activeVersions`; customer configuration remains separately owned. |

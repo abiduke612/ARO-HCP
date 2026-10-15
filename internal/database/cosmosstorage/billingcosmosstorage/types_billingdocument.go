@@ -56,6 +56,7 @@ type BillingDocument struct {
 	// The HCP cluster ARM resource ID
 	ResourceID *azcorearm.ResourceID `json:"resourceId,omitempty"`
 	// The ARM resource ID of the managed resource group of the HCP cluster
+	// Written by: CreateBillingDoc, ReconcileBillingManagedResourceGroup
 	ManagedResourceGroup string `json:"managedResourceGroup,omitempty"`
 }
 
@@ -77,6 +78,11 @@ type BillingDocumentPatchOperations struct {
 // SetDeletionTime appends a set operation for the DeletionTime field.
 func (p *BillingDocumentPatchOperations) SetDeletionTime(deletionTime time.Time) {
 	p.AppendSet("/deletionTime", deletionTime)
+}
+
+// SetManagedResourceGroup appends a set operation for the managed RG ARM ID.
+func (p *BillingDocumentPatchOperations) SetManagedResourceGroup(resourceGroupID string) {
+	p.AppendSet("/managedResourceGroup", resourceGroupID)
 }
 
 // BillingDocumentList is a list of billing documents for use with Kubernetes informers.

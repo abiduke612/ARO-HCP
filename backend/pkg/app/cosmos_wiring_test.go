@@ -31,6 +31,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/data/azcosmos"
 
+	"github.com/Azure/ARO-HCP/backend/pkg/controllers/billing"
 	"github.com/Azure/ARO-HCP/backend/pkg/controllers/mismatch"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/cosmosclient"
 	"github.com/Azure/ARO-HCP/internal/database/cosmosstorage/cosmosratelimit"
@@ -229,6 +230,7 @@ func TestStorageFactoryConcurrentMCContainerLookups(t *testing.T) {
 func TestBackendStorageRegistrations(t *testing.T) {
 	for _, realFPA := range []bool{false, true} {
 		names := BackendStorageControllerNames(realFPA)
+		require.Contains(t, names, strings.ToLower(billing.ReconcileBillingManagedResourceGroupControllerName))
 		options := storageTestOptions(t, func(*http.Request) (*http.Response, error) {
 			t.Fatal("startup must not contact Cosmos")
 			return nil, nil
