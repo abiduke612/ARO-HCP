@@ -23,9 +23,14 @@ import (
 	"time"
 
 	"github.com/go-logr/logr/funcr"
+	"github.com/go-logr/logr/testr"
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/ptr"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 
 	"github.com/Azure/ARO-HCP/internal/api/coreapi"
 	"github.com/Azure/ARO-HCP/internal/apitesting/coreapitesting"
@@ -48,6 +53,78 @@ func (l snapshotTestLister[T]) Items(context.Context) cosmosstorageutils.DBClien
 }
 func (snapshotTestLister[T]) GetContinuationToken() string { return "" }
 func (snapshotTestLister[T]) GetError() error              { return nil }
+
+type versionedBillingTestLister struct {
+	current atomic.Pointer[billingcosmosstorage.BillingDocument]
+	calls   atomic.Int32
+}
+
+func (l *versionedBillingTestLister) List(context.Context, *cosmosstorageutils.DBClientListResourceDocsOptions) (cosmosstorageutils.DBClientIterator[billingcosmosstorage.BillingDocument], error) {
+	l.calls.Add(1)
+	return snapshotTestLister[billingcosmosstorage.BillingDocument]{item: l.current.Load(), calls: &l.calls}, nil
+}
+
+func TestBillingInformerVersionedUpdates(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		resync time.Duration
+	}{
+		{name: "hourly resync", resync: time.Hour},
+		{name: "resync disabled", resync: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(utils.ContextWithLogger(t.Context(), testr.New(t)), 15*time.Second)
+			defer cancel()
+			initial := billingcosmosstorage.NewBillingDocument("CLUSTER-UID", mustParseResourceID(t, coreapitesting.TestClusterResourceID))
+			initial.CosmosETag = azcore.ETag(`"version-1"`)
+			initial.ManagedResourceGroup = "old-rg"
+			lister := &versionedBillingTestLister{}
+			lister.current.Store(initial)
+			informer := NewBillingInformerWithRelistDuration(lister, 100*time.Millisecond)
+			updates := make(chan [2]string, 10)
+			registration, err := informer.AddEventHandlerWithOptions(cache.ResourceEventHandlerFuncs{
+				UpdateFunc: func(oldObj, newObj any) {
+					oldDoc := oldObj.(*billingcosmosstorage.BillingDocument)
+					newDoc := newObj.(*billingcosmosstorage.BillingDocument)
+					select {
+					case updates <- [2]string{oldDoc.GetObjectMeta().GetResourceVersion(), newDoc.GetObjectMeta().GetResourceVersion()}:
+					case <-ctx.Done():
+					}
+				},
+			}, cache.HandlerOptions{ResyncPeriod: ptr.To(tc.resync)})
+			require.NoError(t, err)
+			done := make(chan struct{})
+			go func() { defer close(done); informer.RunWithContext(ctx) }()
+			defer func() { cancel(); <-done }()
+			require.True(t, cache.WaitForCacheSync(ctx.Done(), registration.HasSynced))
+			require.Equal(t, "cluster-uid", initial.GetObjectMeta().GetName())
+			require.Eventually(t, func() bool { return lister.calls.Load() >= 2 }, 10*time.Second, 20*time.Millisecond)
+			changed := initial.DeepCopy()
+			changed.CosmosETag = azcore.ETag(`"version-2"`)
+			changed.ManagedResourceGroup = "managed-rg"
+			lister.current.Store(changed)
+			awaitChanged := func() [2]string {
+				for {
+					select {
+					case got := <-updates:
+						if got[1] == `"version-2"` {
+							return got
+						}
+					case <-ctx.Done():
+						t.Fatal("changed billing document did not notify listener before resync")
+					}
+				}
+			}
+			if diff := cmp.Diff([2]string{`"version-1"`, `"version-2"`}, awaitChanged()); diff != "" {
+				t.Fatalf("resource versions (-want +got):\n%s", diff)
+			}
+			cached, exists, err := informer.GetIndexer().GetByKey("cluster-uid")
+			require.NoError(t, err)
+			require.True(t, exists)
+			require.Equal(t, "managed-rg", cached.(*billingcosmosstorage.BillingDocument).ManagedResourceGroup)
+		})
+	}
+}
 
 func TestPollingInformerSnapshots(t *testing.T) {
 	for _, container := range []string{"billing", "resources"} {
