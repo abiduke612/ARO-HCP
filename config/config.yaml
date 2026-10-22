@@ -1013,7 +1013,6 @@ defaults:
   # Billing
   billing:
     rg: "placeholder"
-    useGlobalMeterIds: false
     aub:
       accountName: ""
       cloudSuffix: ""
