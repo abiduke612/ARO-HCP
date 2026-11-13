@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -37,6 +38,8 @@ import (
 	kvsteps "github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/engine/steps/keyvault"
 	netsteps "github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/engine/steps/network"
 	rgsteps "github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/engine/steps/resourcegroup"
+	aubsteps "github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/engine/steps/usagebilling"
+	"github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/prerequisites"
 )
 
 const (
@@ -49,6 +52,7 @@ const (
 
 // WorkflowOptions controls runner behavior for cleanup workflows.
 type WorkflowOptions struct {
+	RequireAbsent   []prerequisites.ResourceAbsence
 	Wait            bool
 	DryRun          bool
 	Parallelism     int
@@ -61,6 +65,9 @@ type WorkflowOptions struct {
 //
 // Deletes all resources in a resource group except those with locks.
 // Handles dependencies by deleting resources in the proper order:
+//
+// First, AUB accounts are synchronously retired with their dependent children.
+// Failure stops the workflow even when other resource types use best-effort deletion.
 //
 //  1. Remove NSP associations first (with force deletion)
 //
@@ -161,12 +168,30 @@ func ResourceGroupOrderedCleanupWorkflow(
 		return nil, fmt.Errorf("failed to create subscriptions client: %w", err)
 	}
 
+	var checkPrerequisites runner.VerifyFn
+	prerequisites := slices.Clone(opts.RequireAbsent)
+	if len(prerequisites) != 0 {
+		for _, prerequisite := range prerequisites {
+			if err := prerequisite.Validate(); err != nil {
+				return nil, err
+			}
+		}
+		checkPrerequisites = func(ctx context.Context) error {
+			return armsteps.CheckResourcesAbsent(ctx, resourcesClient, prerequisites)
+		}
+	}
+	aubStep, err := aubsteps.NewDeletionStep(resourceGroupName, resourcesClient, locksClient, credential, clientOptions, prerequisites)
+	if err != nil {
+		return nil, fmt.Errorf("create AUB cleanup step: %w", err)
+	}
 	return &runner.Engine{
+		PreRunFn:    checkPrerequisites,
 		Parallelism: opts.Parallelism,
 		DryRun:      opts.DryRun,
 		Wait:        opts.Wait,
 		PostRunFn:   resourceGroupSummaryFn(resourcesClient, resourceGroupName, opts),
 		Steps: []runner.Step{
+			aubStep,
 			netsteps.MustNewNSPForceDeleteStep(netsteps.NSPForceDeleteStepConfig{
 				ResourceGroupName: resourceGroupName,
 				ResourcesClient:   resourcesClient,
@@ -290,6 +315,8 @@ func ResourceGroupOrderedCleanupWorkflow(
 				LocksClient:       locksClient,
 				APIVersionCache:   apiVersionCache,
 				Selector: armsteps.ResourceSelector{ExcludedResourceTypes: []string{
+					// AUB must complete its child deletion before any generic deletion can proceed.
+					"Microsoft.UsageBilling/accounts",
 					// Networking resources
 					"Microsoft.Network/networkSecurityPerimeters",
 					"Microsoft.Network/privateEndpoints/privateDnsZoneGroups",

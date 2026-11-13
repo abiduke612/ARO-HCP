@@ -67,6 +67,7 @@ func Run(ctx context.Context, opts RunOptions) error {
 	for _, resourceGroupName := range resourceGroups {
 		rgLogger := logger.WithValues("resourceGroup", resourceGroupName)
 		rgCtx := logr.NewContext(ctx, rgLogger)
+		groupID := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s", opts.SubscriptionID, resourceGroupName)
 
 		workflow, err := cleanupengine.ResourceGroupOrderedCleanupWorkflow(
 			rgCtx,
@@ -74,6 +75,7 @@ func Run(ctx context.Context, opts RunOptions) error {
 			opts.SubscriptionID,
 			opts.AzureCredential,
 			cleanupengine.WorkflowOptions{
+				RequireAbsent:   opts.Policy.AbsencePrerequisites(groupID),
 				DryRun:          opts.DryRun,
 				Wait:            opts.Wait,
 				Parallelism:     opts.Parallelism,

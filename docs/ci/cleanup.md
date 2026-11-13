@@ -74,6 +74,70 @@ Because of that, it is more tolerant than per-test cleanup:
 - it is comfortable with async deletion
 - it favors getting the environment moving toward deletion over proving that every step completed synchronously
 
+#### Azure Usage Billing resource groups
+
+Regional cleanup includes `billing.rg` when configured and present in the selected
+topology's execution graph. It does not add `global.billing.rg` to the regional
+allowlist. Supply the topology containing the billing services; the upstream
+topology alone cannot select services defined only in downstream configuration.
+
+The ordered resource-group workflow discovers `Microsoft.UsageBilling/accounts`
+and retires their children before generic deletion. It closes and deletes output
+selectors, removes PAv2 outputs, then pipelines, inputs and exports, and finally
+the account. AUB operations always complete synchronously, including with
+`--wait=false`, because parent deletion rejects existing children. Any AUB failure,
+management lock, lock-discovery failure, or remaining soft-deleted resource stops
+that workflow before resource-group deletion, even in best-effort mode. Existing
+dry-run behavior performs discovery without writes.
+
+Before any AUB mutation, the step requires confirmed ARM absence of every configured
+producer service cluster. Existing clusters (including `Deleting`), unknown mappings,
+and lookup failures retain AUB and stop that RG's workflow. Topology cleanup derives
+these IDs from `svc.subscription.key`, `svc.rg`, and `svc.aks.name` for matching
+`billing.rg` entries. Concurrent topology cleanup may require a later run after
+service-cluster deletion completes; it does not wait for that cluster to disappear.
+Topology cleanup resolves all target subscriptions and prerequisites before starting
+mutations. Independent RG workflows finish even if billing is retained; their errors
+are returned together rather than cancelling the service-cluster cleanup.
+
+Direct and scheduled `rg-ordered` runs require an explicit policy mapping:
+
+```yaml
+rgOrdered:
+  requireAbsent:
+    /subscriptions/<subscription-id>/resourceGroups/<billing-rg>:
+    - id: /subscriptions/<subscription-id>/resourceGroups/<service-rg>/providers/Microsoft.ContainerService/managedClusters/<service-cluster>
+      apiVersion: "2024-10-01"
+      purpose: producer
+```
+
+The generic `requireAbsent` mapping supplies ARM absence prerequisites, not deletion
+candidates; it can express dependencies for other resource-group cleanup workflows too.
+The AUB step specifically requires an AKS resource marked `purpose: producer`; an
+unrelated generic prerequisite cannot authorize AUB retirement. Configuration must
+identify the actual producer; resource names and a not-found response cannot prove
+that association independently.
+Existing discovery rules
+and explicit RG selection still determine what gets cleaned up. For an explicit-only
+run, use a skip-all discovery rule; a policy with no discovery rules is invalid.
+No scheduled job subscriptions, credential profiles or discovery rules are changed
+by adding this handler.
+
+Establish the disposition of pending usage before invoking teardown: cluster
+absence proves the producer is stopped, not billing completeness.
+Only legacy pipeline-level PAv2 selectors are automatically closed; category-based
+or future-dated selectors require explicit retirement. Reruns rediscover current
+state instead of depending on earlier in-memory progress. Concurrent provisioning
+must be excluded; the read/check and delete sequence is not an atomic transaction.
+
+The [AUB Commerce output documentation](https://eng.ms/docs/cloud-ai-platform/azure-data/azure-data-azure-usage-billing/azure-usage-billing/azure-usage-billing/azure-usage-billing-customer-docs/customer/howto/commerce-integration/setup-commerce-output)
+describes publication closure, and the [PAv2 integration documentation](https://eng.ms/docs/cloud-ai-platform/azure-data/azure-data-azure-usage-billing/azure-usage-billing/azure-usage-billing/azure-usage-billing-customer-docs/customer/howto/commerce-integration/setup-pav2-integration)
+requires selector deletion before PAv2Output deletion. The implementation links
+the inspected AUB source for parent-delete checks and the selector PUT contract.
+PAv2Output deletion requests Commerce unregistration; ARM completion is not proof
+that final Commerce unregistration has completed. Direct portal/ARM resource-group
+DELETE requests do not invoke this workflow.
+
 ### Background hygiene
 
 #### Disposable service certificates

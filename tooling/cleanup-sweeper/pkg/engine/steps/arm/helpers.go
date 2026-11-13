@@ -16,15 +16,37 @@ package arm
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 
 	"github.com/go-logr/logr"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armlocks"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 
 	"github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/engine/runner"
+	"github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/prerequisites"
 )
+
+// CheckResourcesAbsent accepts only recognized ARM not-found responses. A resource
+// whose provisioning state is Deleting still exists and cannot satisfy the prerequisite.
+func CheckResourcesAbsent(ctx context.Context, client *armresources.Client, resources []prerequisites.ResourceAbsence) error {
+	for _, resource := range resources {
+		_, err := client.GetByID(ctx, resource.ID, resource.APIVersion, nil)
+		var response *azcore.ResponseError
+		if errors.As(err, &response) && response.StatusCode == http.StatusNotFound && (strings.EqualFold(response.ErrorCode, "ResourceNotFound") || strings.EqualFold(response.ErrorCode, "ResourceGroupNotFound") || strings.EqualFold(response.ErrorCode, "ParentResourceNotFound")) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("verify absence prerequisite %s: %w", resource.ID, err)
+		}
+		return fmt.Errorf("absence prerequisite %s still exists; retaining dependent resources", resource.ID)
+	}
+	return nil
+}
 
 // ListByType lists all resources of a specific type in a resource group.
 func ListByType(

@@ -19,10 +19,49 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/prerequisites"
 )
+
+func TestAbsencePrerequisitePolicy(t *testing.T) {
+	const group = "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/billing"
+	const cluster = "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/service/providers/Microsoft.ContainerService/managedClusters/producer"
+	valid := prerequisites.ResourceAbsence{ID: cluster, APIVersion: "2024-10-01", Purpose: prerequisites.Producer}
+	for _, tc := range []struct {
+		name      string
+		entries   map[string][]prerequisites.ResourceAbsence
+		wantError bool
+	}{
+		{name: "valid", entries: map[string][]prerequisites.ResourceAbsence{group: {valid}}},
+		{name: "empty requirements", entries: map[string][]prerequisites.ResourceAbsence{group: {}}, wantError: true},
+		{name: "duplicate case insensitive group", entries: map[string][]prerequisites.ResourceAbsence{group: {valid}, strings.ToUpper(group): {valid}}, wantError: true},
+		{name: "missing version", entries: map[string][]prerequisites.ResourceAbsence{group: {{ID: cluster, Purpose: prerequisites.Producer}}}, wantError: true},
+		{name: "invalid purpose", entries: map[string][]prerequisites.ResourceAbsence{group: {{ID: cluster, APIVersion: "2024-10-01", Purpose: "typo"}}}, wantError: true},
+		{name: "invalid resource ID", entries: map[string][]prerequisites.ResourceAbsence{group: {{ID: cluster + "/../other", APIVersion: "2024-10-01"}}}, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := RGOrderedPolicy{RequireAbsent: tc.entries, Discovery: RGDiscoveryPolicy{Rules: []RGDiscoveryRule{{Action: RGDiscoveryActionSkip, Match: RGDiscoveryMatch{Any: true}}}}}
+			err := p.Validate("rgOrdered")
+			if (err != nil) != tc.wantError {
+				t.Fatalf("wantError=%v, got %v", tc.wantError, err)
+			}
+			if tc.wantError {
+				return
+			}
+			if diff := cmp.Diff([]prerequisites.ResourceAbsence{valid}, p.AbsencePrerequisites(strings.ToUpper(group))); diff != "" {
+				t.Fatalf("mapping (-want +got):\n%s", diff)
+			}
+			if got := p.AbsencePrerequisites(group + "-other"); len(got) != 0 {
+				t.Fatalf("unrelated RG inherited prerequisites: %v", got)
+			}
+		})
+	}
+}
 
 func TestPolicyValidate_ParsesRegexDurationAndNormalizes(t *testing.T) {
 	t.Parallel()

@@ -77,10 +77,16 @@ type Engine struct {
 	DryRun      bool
 	Wait        bool
 	PostRunFn   func(ctx context.Context) error
+	PreRunFn    func(ctx context.Context) error
 }
 
 // Run executes all configured steps in order and then executes PostRunFn if set.
 func (e *Engine) Run(ctx context.Context) error {
+	if e.PreRunFn != nil {
+		if err := e.PreRunFn(ctx); err != nil {
+			return fmt.Errorf("cleanup prerequisites: %w", err)
+		}
+	}
 	parallelism := e.Parallelism
 	if parallelism < 1 {
 		parallelism = DefaultParallelism

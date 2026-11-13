@@ -67,6 +67,30 @@ func (f *fakeStep) RetryLimit() int {
 
 func (f *fakeStep) ContinueOnError() bool { return f.continueOnError }
 
+func TestEnginePrerequisites(t *testing.T) {
+	blocked := errors.New("prerequisite exists")
+	for _, tc := range []struct {
+		name        string
+		err         error
+		wantDeletes int
+	}{
+		{name: "satisfied", wantDeletes: 1},
+		{name: "blocked", err: blocked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			step := &fakeStep{name: "delete", targets: []Target{{ID: "resource"}}, continueOnError: true}
+			eng := Engine{Steps: []Step{step}, Parallelism: 1, PreRunFn: func(context.Context) error { return tc.err }}
+			err := eng.Run(logr.NewContext(context.Background(), logr.Discard()))
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("want %v, got %v", tc.err, err)
+			}
+			if step.deleteCalls != tc.wantDeletes {
+				t.Fatalf("want %d deletes, got %d", tc.wantDeletes, step.deleteCalls)
+			}
+		})
+	}
+}
+
 func TestEngineRun(t *testing.T) {
 	t.Parallel()
 

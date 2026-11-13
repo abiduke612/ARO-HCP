@@ -16,6 +16,9 @@ package engine
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -23,10 +26,32 @@ import (
 	"github.com/go-logr/logr"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 
 	"github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/engine/runner"
 )
+
+type workflowTransport func(*http.Request) (*http.Response, error)
+
+func (f workflowTransport) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestAUBPrecedesResourceGroupCleanup(t *testing.T) {
+	for _, bestEffort := range []bool{false, true} {
+		t.Run(fmt.Sprint("continueOnError=", bestEffort), func(t *testing.T) {
+			options := &azcorearm.ClientOptions{ClientOptions: azcore.ClientOptions{Transport: workflowTransport(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Request: r, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"name":"billing","location":"westus3"}`))}, nil
+			})}}
+			workflow, err := ResourceGroupOrderedCleanupWorkflow(logr.NewContext(context.Background(), logr.Discard()), "billing", "11111111-1111-1111-1111-111111111111", workflowsTestCredential{}, WorkflowOptions{ContinueOnError: bestEffort, ClientOptions: options})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if workflow.Steps[0].Name() != "Delete Azure Usage Billing accounts" || workflow.Steps[0].ContinueOnError() {
+				t.Fatal("AUB must be a strict prerequisite for all subsequent cleanup")
+			}
+		})
+	}
+}
 
 func TestWorkflowBuilders(t *testing.T) {
 	t.Parallel()

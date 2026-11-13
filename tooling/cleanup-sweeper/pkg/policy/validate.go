@@ -19,6 +19,8 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 )
 
 // Validate validates the full policy.
@@ -34,6 +36,22 @@ func (p *Policy) Validate() error {
 
 // Validate validates ordered cleanup policy sections.
 func (p *RGOrderedPolicy) Validate(fieldPrefix string) error {
+	seen := sets.New[string]()
+	for groupID, prerequisites := range p.RequireAbsent {
+		id, err := azcorearm.ParseResourceID(groupID)
+		if err != nil || !strings.EqualFold(id.ResourceType.String(), "Microsoft.Resources/resourceGroups") || len(id.SubscriptionID) == 0 || len(prerequisites) == 0 {
+			return fmt.Errorf("%s.requireAbsent: expected a full resource-group ID and nonempty prerequisites, got %q", fieldPrefix, groupID)
+		}
+		if seen.Has(strings.ToLower(groupID)) {
+			return fmt.Errorf("%s.requireAbsent: duplicate resource group %q", fieldPrefix, groupID)
+		}
+		seen.Insert(strings.ToLower(groupID))
+		for _, prerequisite := range prerequisites {
+			if err := prerequisite.Validate(); err != nil {
+				return fmt.Errorf("%s.requireAbsent: %w", fieldPrefix, err)
+			}
+		}
+	}
 	p.ExcludedResourceGroups = normalizeStringSetLower(p.ExcludedResourceGroups)
 	return p.Discovery.Validate(fieldPrefix + ".discovery")
 }

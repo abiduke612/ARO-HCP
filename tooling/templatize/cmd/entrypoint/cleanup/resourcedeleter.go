@@ -23,6 +23,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 
 	cleanupengine "github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/engine"
+	"github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/prerequisites"
 )
 
 // resourceGroupDeleter handles ordered deletion of resources in a resource group
@@ -33,6 +34,7 @@ type resourceGroupDeleter struct {
 	wait              bool
 	dryRun            bool
 	parallelism       int
+	requireAbsent     []prerequisites.ResourceAbsence
 }
 
 func (d *resourceGroupDeleter) execute(ctx context.Context) error {
@@ -51,6 +53,7 @@ func (d *resourceGroupDeleter) execute(ctx context.Context) error {
 		d.subscriptionID,
 		d.credential,
 		cleanupengine.WorkflowOptions{
+			RequireAbsent:   d.requireAbsent,
 			Wait:            d.wait,
 			DryRun:          d.dryRun,
 			Parallelism:     d.parallelism,

@@ -18,8 +18,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/prerequisites"
 )
 
 // Policy is the top-level cleanup-sweeper policy document.
@@ -29,8 +32,21 @@ type Policy struct {
 
 // RGOrderedPolicy configures ordered cleanup candidate discovery and exclusions.
 type RGOrderedPolicy struct {
-	ExcludedResourceGroups []string          `json:"excludedResourceGroups" yaml:"excludedResourceGroups"`
-	Discovery              RGDiscoveryPolicy `json:"discovery" yaml:"discovery"`
+	// RequireAbsent maps full resource-group IDs to resources that must be absent before cleanup.
+	// These prerequisites do not select resource groups for deletion.
+	RequireAbsent          map[string][]prerequisites.ResourceAbsence `json:"requireAbsent,omitempty" yaml:"requireAbsent,omitempty"`
+	ExcludedResourceGroups []string                                   `json:"excludedResourceGroups" yaml:"excludedResourceGroups"`
+	Discovery              RGDiscoveryPolicy                          `json:"discovery" yaml:"discovery"`
+}
+
+// AbsencePrerequisites returns an independent copy for the exact target group.
+func (p RGOrderedPolicy) AbsencePrerequisites(groupID string) []prerequisites.ResourceAbsence {
+	for configuredGroup, resources := range p.RequireAbsent {
+		if strings.EqualFold(configuredGroup, groupID) {
+			return slices.Clone(resources)
+		}
+	}
+	return nil
 }
 
 // RGDiscoveryPolicy contains first-match-wins discovery rules.

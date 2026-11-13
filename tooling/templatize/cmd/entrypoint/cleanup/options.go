@@ -17,22 +17,27 @@ package cleanup
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
 	"slices"
+	"strings"
+	"sync"
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	configtypes "github.com/Azure/ARO-Tools/config/types"
 	"github.com/Azure/ARO-Tools/pipelines/graph"
 	"github.com/Azure/ARO-Tools/pipelines/topology"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 
+	"github.com/Azure/ARO-HCP/tooling/cleanup-sweeper/pkg/prerequisites"
 	"github.com/Azure/ARO-HCP/tooling/templatize/cmd/entrypoint/entrypointutils"
 	"github.com/Azure/ARO-HCP/tooling/templatize/pkg/pipeline"
 )
@@ -166,10 +171,13 @@ func (o *Options) CleanUpResources(ctx context.Context) error {
 
 	var regionalRGs sets.Set[string]
 	if o.OnlyRegional {
-		regionalRGs = sets.New(entrypointutils.RegionalResourceGroupNames(o.StampConfigs)...)
+		regionalRGs, err = regionalCleanupResourceGroups(o.StampConfigs)
+		if err != nil {
+			return err
+		}
 	}
 
-	group, groupCtx := errgroup.WithContext(ctx)
+	var planned []cleanupOperation
 
 	sortedKeys := slices.SortedFunc(maps.Keys(executionGraph.ResourceGroups), func(a, b graph.ResourceGroupKey) int {
 		if c := cmp.Compare(a.Stamp.String(), b.Stamp.String()); c != 0 {
@@ -197,11 +205,14 @@ func (o *Options) CleanUpResources(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to lookup subscription ID for %q: %w", resourceGroup.Subscription, err)
 		}
-
-		rgLogger.Info("Deleting resource group with ordered resource cleanup")
+		requireAbsent, err := billingCleanupPrerequisites(ctx, o.StampConfigs, resourceGroup.ResourceGroup, subscriptionID, o.SubscriptionLookup)
+		if err != nil {
+			return err
+		}
 
 		// Create deleter for this resource group
 		deleter := &resourceGroupDeleter{
+			requireAbsent:     requireAbsent,
 			resourceGroupName: resourceGroup.ResourceGroup,
 			subscriptionID:    subscriptionID,
 			credential:        o.AzureCredential,
@@ -210,15 +221,10 @@ func (o *Options) CleanUpResources(ctx context.Context) error {
 			parallelism:       o.Parallelism,
 		}
 
-		// Always execute in parallel via errgroup
-		rgCtx := logr.NewContext(groupCtx, rgLogger.WithValues("subscriptionID", subscriptionID))
-		group.Go(func() error {
-			return deleter.execute(rgCtx)
-		})
+		planned = append(planned, cleanupOperation{name: subscriptionID + "/" + resourceGroup.ResourceGroup, logger: rgLogger.WithValues("subscriptionID", subscriptionID), execute: deleter.execute})
 	}
 
-	// Always wait for the errgroup to ensure all deletions are started
-	if err := group.Wait(); err != nil {
+	if err := executeCleanupOperations(ctx, planned); err != nil {
 		return err
 	}
 
@@ -229,4 +235,102 @@ func (o *Options) CleanUpResources(ctx context.Context) error {
 		logger.Info("Cleaned up step cache dir.", "dir", o.StepCacheDir)
 	}
 	return nil
+}
+
+func billingCleanupPrerequisites(ctx context.Context, configs map[graph.Stamp]configtypes.Configuration, resourceGroup, subscriptionID string, lookup pipeline.SubscriptionLookup) ([]prerequisites.ResourceAbsence, error) {
+	resources := map[string]prerequisites.ResourceAbsence{}
+	for _, cfg := range configs {
+		billingRG, err := cfg.GetByPath("billing.rg")
+		var missing *configtypes.MissingKeyError
+		if errors.As(err, &missing) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		name, ok := billingRG.(string)
+		if !ok {
+			return nil, fmt.Errorf("billing.rg must be a string, got %T", billingRG)
+		}
+		if !strings.EqualFold(name, resourceGroup) {
+			continue
+		}
+		values := make(map[string]string)
+		for _, path := range []string{"svc.subscription.key", "svc.rg", "svc.aks.name"} {
+			value, err := cfg.GetByPath(path)
+			if err != nil {
+				return nil, fmt.Errorf("derive billing producer: %w", err)
+			}
+			text, ok := value.(string)
+			if !ok || len(strings.TrimSpace(text)) == 0 || strings.ContainsAny(text, "/\\?#%") {
+				return nil, fmt.Errorf("invalid %s for billing producer", path)
+			}
+			values[path] = text
+		}
+		svcSub, err := lookup(ctx, values["svc.subscription.key"])
+		if err != nil {
+			return nil, fmt.Errorf("resolve billing producer subscription: %w", err)
+		}
+		// Billing.Regional deploys billing.rg into the service subscription.
+		if !strings.EqualFold(svcSub, subscriptionID) {
+			continue
+		}
+		id := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.ContainerService/managedClusters/%s", svcSub, values["svc.rg"], values["svc.aks.name"])
+		prerequisite := prerequisites.ResourceAbsence{ID: id, APIVersion: "2024-10-01", Purpose: prerequisites.Producer}
+		if err := prerequisite.Validate(); err != nil {
+			return nil, err
+		}
+		resources[strings.ToLower(id)] = prerequisite
+	}
+	return slices.SortedFunc(maps.Values(resources), func(a, b prerequisites.ResourceAbsence) int { return strings.Compare(a.ID, b.ID) }), nil
+}
+
+type cleanupOperation struct {
+	name    string
+	logger  logr.Logger
+	execute func(context.Context) error
+}
+
+// A blocked dependency must not cancel the sibling cleanup that can satisfy it.
+// Resolve and validate the entire plan before starting independent RG operations.
+func executeCleanupOperations(ctx context.Context, operations []cleanupOperation) error {
+	var workers sync.WaitGroup
+	results := make(chan error, len(operations))
+	for _, operation := range operations {
+		workers.Add(1)
+		go func() {
+			defer utilruntime.HandleCrash()
+			defer workers.Done()
+			if err := operation.execute(logr.NewContext(ctx, operation.logger)); err != nil {
+				results <- fmt.Errorf("cleanup %s: %w", operation.name, err)
+			}
+		}()
+	}
+	workers.Wait()
+	close(results)
+	var failures []error
+	for err := range results {
+		failures = append(failures, err)
+	}
+	return errors.Join(append(failures, ctx.Err())...)
+}
+
+func regionalCleanupResourceGroups(configs map[graph.Stamp]configtypes.Configuration) (sets.Set[string], error) {
+	names := sets.New(entrypointutils.RegionalResourceGroupNames(configs)...)
+	for _, cfg := range configs {
+		billingRG, err := cfg.GetByPath("billing.rg")
+		var missing *configtypes.MissingKeyError
+		if errors.As(err, &missing) {
+			continue // Billing is optional in topologies that do not deploy it.
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read billing.rg: %w", err)
+		}
+		name, ok := billingRG.(string)
+		if !ok || len(name) == 0 {
+			return nil, fmt.Errorf("billing.rg must be a nonempty string, got %T", billingRG)
+		}
+		names.Insert(name)
+	}
+	return names, nil
 }
